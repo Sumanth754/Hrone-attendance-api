@@ -627,3 +627,97 @@ def list_attendance(
     }
 
 
+@app.patch(
+    "/attendance/{emp_code}/{date}",
+    tags=["attendance"],
+    summary="Regularize (manually correct) one day's record",
+)
+def regularize(emp_code: str, date: date, body: RegularizeRequest):
+    # `date` is a real calendar date per the contract (path {date}); FastAPI
+    # validates the format and returns 422 on garbage. Keep the "YYYY-MM-DD"
+    # string form because that is how the record's `date` field is stored.
+    date_str = date.isoformat()
+    emp = employees.find_one({"emp_code": emp_code})
+    if not emp:
+        raise HTTPException(status_code=404, detail="unknown employee")
+
+    record = attendance.find_one({"emp_code": emp_code, "date": date_str})
+    if not record:
+        raise HTTPException(status_code=404, detail="no record for that date")
+
+    provided = body.model_fields_set
+
+    # Merge supplied values over the stored ones.
+    new_status = body.status.value if "status" in provided else record["status"]
+    new_punch_in = dt_from_ms(body.punch_in) if ("punch_in" in provided and body.punch_in is not None) else record.get("punch_in")
+    new_punch_out = dt_from_ms(body.punch_out) if ("punch_out" in provided and body.punch_out is not None) else record.get("punch_out")
+
+    # Normalise timezone (tz_aware should already have done this).
+    if new_punch_in is not None and new_punch_in.tzinfo is None:
+        new_punch_in = new_punch_in.replace(tzinfo=UTC)
+    if new_punch_out is not None and new_punch_out.tzinfo is None:
+        new_punch_out = new_punch_out.replace(tzinfo=UTC)
+
+    # --- rules --------------------------------------------------------- #
+    if new_status in ("ABSENT", "LEAVE"):
+        # Setting a non-presence status means the day has no punch times.
+        if ("punch_in" in provided and body.punch_in is not None) or (
+            "punch_out" in provided and body.punch_out is not None
+        ):
+            raise HTTPException(status_code=422, detail="ABSENT/LEAVE cannot carry punch times")
+        new_punch_in, new_punch_out = None, None
+    else:
+        if new_punch_in is None:
+            raise HTTPException(status_code=422, detail="presence status requires a punch_in")
+
+    if new_punch_in is not None and attendance_date_for(emp, new_punch_in) != date_str:
+        raise HTTPException(status_code=422, detail="punch_in must fall on the record's attendance date")
+
+    if new_punch_in is not None and new_punch_out is not None:
+        if new_punch_out <= new_punch_in:
+            raise HTTPException(status_code=422, detail="punch_out must be after punch_in")
+        if (new_punch_out - new_punch_in) > timedelta(hours=24):
+            raise HTTPException(status_code=422, detail="punch_out is more than 24 hours after punch_in")
+
+    derived = derive_fields(emp, new_status, new_punch_in, new_punch_out, date_str)
+
+    # --- work out what actually changed --------------------------------- #
+    old = {
+        "status": record["status"],
+        "punch_in": record.get("punch_in"),
+        "punch_out": record.get("punch_out"),
+        "work_hours": record.get("work_hours"),
+        "late_minutes": record.get("late_minutes") or 0,
+        "overtime_minutes": record.get("overtime_minutes") or 0,
+        "half_day": bool(record.get("half_day", False)),
+    }
+    new = {"status": new_status, "punch_in": new_punch_in, "punch_out": new_punch_out, **derived}
+
+    changes = {}
+    for field in ("status", "punch_in", "punch_out", "work_hours", "late_minutes", "overtime_minutes", "half_day"):
+        if old[field] != new[field]:
+            changes[field] = {"from": old[field], "to": new[field]}
+
+    if not changes:
+        raise HTTPException(status_code=422, detail="request changes nothing")
+
+    entry = {"at": now_utc(), "by": body.regularized_by, "reason": body.reason, "changes": changes}
+
+    # Optimistic concurrency: only apply if history is still exactly what we
+    # read. Two simultaneous corrections cannot then silently lose each other -
+    # the loser matches nothing and gets a 409.
+    if "history" in record:
+        history_filter: dict = {"history": record["history"]}
+    else:
+        history_filter = {"history": {"$exists": False}}
+
+    updated = attendance.find_one_and_update(
+        {"_id": record["_id"], **history_filter},
+        {"$set": new, "$push": {"history": entry}},
+        return_document=True,
+    )
+    if updated is None:
+        raise HTTPException(status_code=409, detail="record was modified concurrently; retry")
+    return serialize_attendance(updated)
+
+
