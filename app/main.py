@@ -395,6 +395,25 @@ def ensure_indexes() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Query + pipeline builders (shared by the endpoints and /admin/explain)
+# --------------------------------------------------------------------------- #
+def attendance_filter(emp_code=None, date_from=None, date_to=None, status=None) -> dict:
+    q: dict = {}
+    if emp_code:
+        q["emp_code"] = emp_code
+    if date_from or date_to:
+        rng: dict = {}
+        if date_from:
+            rng["$gte"] = date_from
+        if date_to:
+            rng["$lte"] = date_to
+        q["date"] = rng
+    if status:
+        q["status"] = status
+    return q
+
+
+# --------------------------------------------------------------------------- #
 # App
 # --------------------------------------------------------------------------- #
 @asynccontextmanager
@@ -452,5 +471,159 @@ def health():
     except Exception:
         raise HTTPException(status_code=503, detail="mongodb unavailable")
     return {"status": "ok"}
+
+
+# --------------------------------------------------------------------------- #
+# employees
+# --------------------------------------------------------------------------- #
+@app.post("/employees", status_code=201, tags=["employees"], summary="Create an employee")
+def create_employee(body: EmployeeCreate):
+    doc = {
+        "emp_code": body.emp_code,
+        "name": body.name,
+        "email": body.email,
+        "department": body.department,
+        "shift_start": body.shift_start,
+        "shift_end": body.shift_end,
+        "joined_on": body.joined_on.isoformat(),
+        "created_at": now_utc(),
+    }
+    try:
+        employees.insert_one(doc)
+    except DuplicateKeyError:
+        # The unique index decides the winner; no check-then-insert race.
+        raise HTTPException(status_code=409, detail="emp_code already exists")
+    return serialize_employee(doc)
+
+
+@app.get("/employees", tags=["employees"], summary="List employees")
+def list_employees(
+    department: Optional[str] = None,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+):
+    q = {"department": department} if department else {}
+    total = employees.count_documents(q)
+    # (page - 1) - the starter skipped a full page on page 1.
+    skip = (page - 1) * page_size
+    cursor = employees.find(q, {"_id": 0}).sort("emp_code", ASCENDING).skip(skip).limit(page_size)
+    return {
+        "items": [serialize_employee(d) for d in cursor],
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# attendance
+# --------------------------------------------------------------------------- #
+@app.post("/attendance/punch-in", status_code=201, tags=["attendance"], summary="Record a punch-in")
+def punch_in(body: PunchInRequest):
+    emp = employees.find_one({"emp_code": body.emp_code})
+    if not emp:
+        raise HTTPException(status_code=404, detail="unknown employee")
+
+    punched_at = dt_from_ms(body.punched_at) if body.punched_at is not None else now_utc()
+    punch_date = attendance_date_for(emp, punched_at)
+
+    record = {
+        "emp_code": body.emp_code,
+        "date": punch_date,
+        "status": body.status.value,
+        "punch_in": punched_at,
+        "punch_out": None,
+        "work_hours": None,
+        "late_minutes": compute_late_minutes(emp, punched_at, punch_date),
+        "overtime_minutes": 0,
+        "half_day": False,
+        "history": [],
+    }
+    try:
+        attendance.insert_one(record)
+    except DuplicateKeyError:
+        raise HTTPException(status_code=409, detail="already punched in for this date")
+    return serialize_attendance(record)
+
+
+@app.post("/attendance/punch-out", tags=["attendance"], summary="Record a punch-out")
+def punch_out(body: PunchOutRequest):
+    emp = employees.find_one({"emp_code": body.emp_code})
+    if not emp:
+        raise HTTPException(status_code=404, detail="unknown employee")
+
+    punched_at = dt_from_ms(body.punched_at) if body.punched_at is not None else now_utc()
+
+    # Most recent open record punched in at or before this instant. Sorting by
+    # punch_in desc also makes overnight shifts work: the shift that started
+    # yesterday evening is the latest punch_in.
+    record = attendance.find_one(
+        {"emp_code": body.emp_code, "punch_in": {"$ne": None, "$lte": punched_at}},
+        sort=[("punch_in", DESCENDING)],
+    )
+    if not record:
+        # Nothing at or before this instant. If the employee has any punch-in
+        # at all, it must be *after* punched_at, which is the "punch out before
+        # punching in" case (422). Otherwise there is genuinely no punch-in.
+        later = attendance.find_one(
+            {"emp_code": body.emp_code, "punch_in": {"$ne": None}},
+            sort=[("punch_in", DESCENDING)],
+        )
+        if later is not None:
+            raise HTTPException(status_code=422, detail="punched_at must be after punch_in")
+        raise HTTPException(status_code=404, detail="no punch-in found")
+
+    punch_in_at = record["punch_in"]
+    if punch_in_at.tzinfo is None:
+        punch_in_at = punch_in_at.replace(tzinfo=UTC)
+
+    if record["punch_out"] is not None:
+        raise HTTPException(status_code=409, detail="record already punched out")
+    if punched_at <= punch_in_at:
+        raise HTTPException(status_code=422, detail="punched_at must be after punch_in")
+    if (punched_at - punch_in_at) > timedelta(hours=24):
+        raise HTTPException(status_code=422, detail="punched_at is more than 24 hours after punch_in")
+
+    derived = derive_fields(emp, record["status"], punch_in_at, punched_at, record["date"])
+    # Conditional update on punch_out is None: if a parallel punch-out already
+    # closed the record, this matches nothing and we return 409.
+    updated = attendance.find_one_and_update(
+        {"_id": record["_id"], "punch_out": None},
+        {"$set": {"punch_out": punched_at, **derived}},
+        return_document=True,
+    )
+    if updated is None:
+        raise HTTPException(status_code=409, detail="record already punched out")
+    return serialize_attendance(updated)
+
+
+@app.get("/attendance", tags=["attendance"], summary="List attendance records")
+def list_attendance(
+    emp_code: Optional[str] = None,
+    date_from: Optional[date] = None,
+    date_to: Optional[date] = None,
+    status: Optional[Status] = None,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+):
+    if date_from and date_to and date_from > date_to:
+        raise HTTPException(status_code=422, detail="date_from must be <= date_to")
+
+    q = attendance_filter(
+        emp_code=emp_code,
+        date_from=date_from.isoformat() if date_from else None,
+        date_to=date_to.isoformat() if date_to else None,
+        status=status.value if status else None,
+    )
+    total = attendance.count_documents(q)
+    skip = (page - 1) * page_size
+    # Sort in the database (there is an index for it), not in Python.
+    cursor = attendance.find(q).sort([("date", DESCENDING), ("emp_code", ASCENDING)]).skip(skip).limit(page_size)
+    return {
+        "items": [serialize_attendance(d) for d in cursor],
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+    }
 
 
